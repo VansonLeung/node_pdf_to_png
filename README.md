@@ -1,16 +1,61 @@
-# React + Vite
+# PDF to PNG Converter (React + Vite + MuPDF)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A client-side PDF processing app that:
 
-Currently, two official plugins are available:
+- loads a PDF from file input
+- renders every page to PNG using MuPDF.js in a Web Worker
+- shows previews and download buttons for every page
+- generates a ZIP with all PNG pages, using JSZip
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Features
 
-## React Compiler
+- Asynchronous PDF processing in a worker (UI remains responsive)
+- Progressive rendering and status updates as pages are converted
+- Full ZIP download of rendered pages
+- Per-page PNG download
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Installation
 
-## Expanding the ESLint configuration
+```bash
+cd /Users/user/Desktop/node_pdf_to_png
+npm install
+```
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## Run in development
+
+```bash
+npm run dev
+```
+
+Open `http://localhost:5173` (or the URL printed by Vite).
+
+## Build for production
+
+```bash
+npm run build
+npm run preview
+```
+
+## File layout
+
+- `src/App.jsx`: main React UI + renderer orchestration
+- `src/pdfRenderWorker.js`: MuPDF worker that does the conversion
+- `src/App.css`, `src/index.css`: UI styling
+- `vite.config.js`: worker output set to `es` for MuPDF module support
+
+## Notes
+
+- MuPDF.js is AGPL-3.0; ensure your project license is compatible.
+- Worker makes array buffer transfer for lowest overhead and incremental updates.
+- If colors or images look wrong in some PDFs, this version is much more robust than pdfjs-dist on mixed CMYK/JPX content.
+
+## Troubleshooting
+
+- `npm run build` fails with top-level await in worker: ensure `vite.config.js` has `worker: { format: 'es' }`.
+- If rendering is stalled, check browser console for any uncaught worker errors.
+- Large PDFs may produce large memory usage because each page output is held in memory for preview and zip.
+
+## Clean up temporary objects
+
+On each reload/close, blob object URLs are released to avoid leaks.
+
