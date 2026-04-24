@@ -1,17 +1,20 @@
-# PDF to PNG Converter (React + Vite + MuPDF)
+# PDF Export Converter (React + Vite + MuPDF)
 
 A client-side PDF processing app that:
 
 - loads a PDF from file input
 - renders every page to PNG using MuPDF.js in a Web Worker
-- shows previews and download buttons for every page
-- generates a ZIP with all PNG pages, using JSZip
+- extracts page text into Markdown-friendly output
+- shows previews and download buttons for generated assets
+- generates ZIP downloads for PNG pages or page-split Markdown files, using JSZip
 
 ## Features
 
 - Asynchronous PDF processing in a worker (UI remains responsive)
 - Progressive rendering and status updates as pages are converted
-- Full ZIP download of rendered pages
+- Full ZIP download of rendered PNG pages
+- Single Markdown document download for the entire PDF
+- Separate Markdown files for each page, bundled as a ZIP
 - Per-page PNG download
 
 ## Installation
@@ -38,8 +41,8 @@ npm run preview
 
 ## File layout
 
-- `src/App.jsx`: main React UI + renderer orchestration
-- `src/pdfRenderWorker.js`: MuPDF worker that does the conversion
+- `src/App.jsx`: main React UI + export orchestration
+- `src/pdfRenderWorker.js`: MuPDF worker that renders PNGs or extracts Markdown text
 - `src/App.css`, `src/index.css`: UI styling
 - `vite.config.js`: worker output set to `es` for MuPDF module support
 

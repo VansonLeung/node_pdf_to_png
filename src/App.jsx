@@ -2,6 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import JSZip from 'jszip'
 import './App.css'
 
+const MARKDOWN_MIME_TYPE = 'text/markdown;charset=utf-8'
+const OUTPUT_OPTIONS = [
+  { value: 'png-zip', label: 'PNG pages as ZIP' },
+  { value: 'markdown-single', label: 'Single Markdown file' },
+  { value: 'markdown-pages', label: 'One Markdown file per page' },
+]
+
 function formatFileSize(bytes) {
   if (bytes < 1024) {
     return `${bytes} B`
@@ -28,6 +35,52 @@ function makePngFileName(baseName, pageNumber) {
   return `${baseName}-page-${String(pageNumber).padStart(3, '0')}.png`
 }
 
+function makeMarkdownFileName(baseName, pageNumber) {
+  return `${baseName}-page-${String(pageNumber).padStart(3, '0')}.md`
+}
+
+function getDocumentTitle(fileName) {
+  return fileName.replace(/\.pdf$/i, '').trim() || 'Document'
+}
+
+function normalizeMarkdownText(text) {
+  const normalized = text
+    .replace(/\r\n/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+
+  return normalized || '_No extractable text on this page._'
+}
+
+function buildMarkdownPageDocument(page) {
+  return `# Page ${page.pageNumber}\n\n${page.content}\n`
+}
+
+function buildCombinedMarkdownDocument(fileName, pages) {
+  if (!pages.length) {
+    return ''
+  }
+
+  const sections = pages
+    .map((page) => `## Page ${page.pageNumber}\n\n${page.content}`)
+    .join('\n\n---\n\n')
+
+  return `# ${getDocumentTitle(fileName)}\n\n${sections}\n`
+}
+
+function makeMarkdownBlob(content) {
+  return new Blob([content], { type: MARKDOWN_MIME_TYPE })
+}
+
+function truncatePreview(text, maxLength = 320) {
+  if (text.length <= maxLength) {
+    return text
+  }
+
+  return `${text.slice(0, maxLength).trimEnd()}...`
+}
+
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
@@ -38,8 +91,11 @@ function downloadBlob(blob, filename) {
 }
 
 function App() {
+  const [outputFormat, setOutputFormat] = useState('png-zip')
+  const [resultFormat, setResultFormat] = useState('')
   const [sourcePdfName, setSourcePdfName] = useState('')
   const [pngPages, setPngPages] = useState([])
+  const [markdownPages, setMarkdownPages] = useState([])
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [isRendering, setIsRendering] = useState(false)
   const [isZipping, setIsZipping] = useState(false)
@@ -59,10 +115,41 @@ function App() {
     })
   }
 
+  function resetResults() {
+    resetPages()
+    setMarkdownPages([])
+  }
+
   const totalPngSize = useMemo(
     () => pngPages.reduce((sum, page) => sum + page.blob.size, 0),
     [pngPages],
   )
+
+  const combinedMarkdown = useMemo(
+    () => buildCombinedMarkdownDocument(sourcePdfName, markdownPages),
+    [markdownPages, sourcePdfName],
+  )
+
+  const totalMarkdownSize = useMemo(() => {
+    if (!markdownPages.length) {
+      return 0
+    }
+
+    if (resultFormat === 'markdown-single') {
+      return makeMarkdownBlob(combinedMarkdown).size
+    }
+
+    return markdownPages.reduce(
+      (sum, page) => sum + makeMarkdownBlob(buildMarkdownPageDocument(page)).size,
+      0,
+    )
+  }, [combinedMarkdown, markdownPages, resultFormat])
+
+  const progressLabel =
+    resultFormat === 'png-zip' ? 'Rendering pages in background' : 'Extracting markdown in background'
+  const hasPngResults = resultFormat === 'png-zip' && pngPages.length > 0
+  const hasMarkdownSingleResult = resultFormat === 'markdown-single' && markdownPages.length > 0
+  const hasMarkdownPageResults = resultFormat === 'markdown-pages' && markdownPages.length > 0
 
   useEffect(() => {
     pagesRef.current = pngPages
@@ -95,13 +182,16 @@ function App() {
       return
     }
 
+    const selectedOutputFormat = outputFormat
+
     setErrorMessage('')
     setSourcePdfName(file.name)
+    setResultFormat(selectedOutputFormat)
     setIsRendering(true)
     setProgress({ current: 0, total: 0 })
 
     try {
-      resetPages()
+      resetResults()
       const data = await file.arrayBuffer()
       const worker = workerRef.current
 
@@ -126,17 +216,28 @@ function App() {
           }
 
           if (message.type === 'page') {
-            const blob = new Blob([message.pngBuffer], { type: 'image/png' })
-            const nextPage = {
-              pageNumber: message.pageNumber,
-              fileName: makePngFileName(baseName, message.pageNumber),
-              blob,
-              width: message.width,
-              height: message.height,
-              previewUrl: URL.createObjectURL(blob),
+            if (selectedOutputFormat === 'png-zip') {
+              const blob = new Blob([message.pngBuffer], { type: 'image/png' })
+              const nextPage = {
+                pageNumber: message.pageNumber,
+                fileName: makePngFileName(baseName, message.pageNumber),
+                blob,
+                width: message.width,
+                height: message.height,
+                previewUrl: URL.createObjectURL(blob),
+              }
+
+              setPngPages((existingPages) => [...existingPages, nextPage])
+            } else {
+              const nextPage = {
+                pageNumber: message.pageNumber,
+                fileName: makeMarkdownFileName(baseName, message.pageNumber),
+                content: normalizeMarkdownText(message.markdown || ''),
+              }
+
+              setMarkdownPages((existingPages) => [...existingPages, nextPage])
             }
 
-            setPngPages((existingPages) => [...existingPages, nextPage])
             setProgress({ current: message.pageNumber, total: message.totalPages })
             return
           }
@@ -170,20 +271,22 @@ function App() {
             type: 'convert-pdf',
             requestId,
             buffer: data,
+            outputFormat: selectedOutputFormat,
           },
           [data],
         )
       })
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : 'Could not process the PDF.')
-      resetPages()
+      resetResults()
+      setResultFormat('')
     } finally {
       setIsRendering(false)
       event.target.value = ''
     }
   }
 
-  async function handleZipDownload() {
+  async function handlePngZipDownload() {
     if (!pngPages.length) {
       return
     }
@@ -208,35 +311,87 @@ function App() {
     }
   }
 
+  function handleMarkdownSingleDownload() {
+    if (!combinedMarkdown) {
+      return
+    }
+
+    const baseName = sanitizeBaseName(sourcePdfName || 'document')
+    downloadBlob(makeMarkdownBlob(combinedMarkdown), `${baseName}.md`)
+  }
+
+  async function handleMarkdownPagesDownload() {
+    if (!markdownPages.length) {
+      return
+    }
+
+    setIsZipping(true)
+    setErrorMessage('')
+
+    try {
+      const zip = new JSZip()
+
+      markdownPages.forEach((page) => {
+        zip.file(page.fileName, buildMarkdownPageDocument(page))
+      })
+
+      const zipBlob = await zip.generateAsync({ type: 'blob' })
+      const zipBaseName = sanitizeBaseName(sourcePdfName || 'document')
+      downloadBlob(zipBlob, `${zipBaseName}-markdown-pages.zip`)
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Could not create ZIP file.')
+    } finally {
+      setIsZipping(false)
+    }
+  }
+
   return (
     <main className="app-shell">
       <section className="panel panel-hero">
-        <p className="eyebrow">PDF to PNG Studio</p>
-        <h1>Turn PDF pages into PNG files and download them as a ZIP.</h1>
+        <p className="eyebrow">PDF Export Studio</p>
+        <h1>Turn PDFs into PNGs or Markdown files in the browser.</h1>
         <p className="subtitle">
-          Drop in a PDF, render every page in-browser, then download any page PNG or the full
-          archive.
+          Choose PNG rendering, a single Markdown export, or one Markdown file per page. Everything
+          runs client-side in a worker, so the PDF never leaves the browser.
         </p>
       </section>
 
       <section className="panel panel-uploader">
-        <label className="file-label" htmlFor="pdf-input">
-          <span>Choose PDF</span>
-          <input
-            id="pdf-input"
-            type="file"
-            accept="application/pdf,.pdf"
-            onChange={handlePdfChange}
-            disabled={isRendering}
-          />
-        </label>
+        <div className="controls-grid">
+          <label className="field-label" htmlFor="output-format">
+            <span>Output format</span>
+            <select
+              id="output-format"
+              value={outputFormat}
+              onChange={(event) => setOutputFormat(event.target.value)}
+              disabled={isRendering}
+            >
+              {OUTPUT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="file-label" htmlFor="pdf-input">
+            <span>Choose PDF</span>
+            <input
+              id="pdf-input"
+              type="file"
+              accept="application/pdf,.pdf"
+              onChange={handlePdfChange}
+              disabled={isRendering}
+            />
+          </label>
+        </div>
 
         {sourcePdfName && <p className="meta-line">Source: {sourcePdfName}</p>}
 
         {isRendering && progress.total > 0 && (
           <div className="progress-wrap" role="status" aria-live="polite">
             <p>
-              Rendering pages in background: {progress.current}/{progress.total}
+              {progressLabel}: {progress.current}/{progress.total}
             </p>
             <div className="progress-track" aria-hidden="true">
               <div
@@ -250,18 +405,20 @@ function App() {
         {errorMessage && <p className="error-box">{errorMessage}</p>}
       </section>
 
-      {!!pngPages.length && (
+      {hasPngResults && (
         <section className="panel panel-actions">
           <p>
             Generated <strong>{pngPages.length}</strong> PNG files ({formatFileSize(totalPngSize)})
           </p>
-          <button type="button" onClick={handleZipDownload} disabled={isZipping}>
-            {isZipping ? 'Building ZIP...' : 'Download ZIP'}
-          </button>
+          <div className="action-group">
+            <button type="button" onClick={handlePngZipDownload} disabled={isZipping}>
+              {isZipping ? 'Building ZIP...' : 'Download ZIP'}
+            </button>
+          </div>
         </section>
       )}
 
-      {!!pngPages.length && (
+      {hasPngResults && (
         <section className="gallery" aria-label="Generated PNG pages">
           {pngPages.map((page) => (
             <article className="page-card" key={page.fileName}>
@@ -278,6 +435,61 @@ function App() {
             </article>
           ))}
         </section>
+      )}
+
+      {hasMarkdownSingleResult && (
+        <>
+          <section className="panel panel-actions">
+            <p>
+              Generated one Markdown file from <strong>{markdownPages.length}</strong> pages (
+              {formatFileSize(totalMarkdownSize)})
+            </p>
+            <div className="action-group">
+              <button type="button" onClick={handleMarkdownSingleDownload}>
+                Download Markdown
+              </button>
+            </div>
+          </section>
+
+          <section className="panel">
+            <p className="section-title">Markdown preview</p>
+            <pre className="markdown-preview">{combinedMarkdown}</pre>
+          </section>
+        </>
+      )}
+
+      {hasMarkdownPageResults && (
+        <>
+          <section className="panel panel-actions">
+            <p>
+              Generated <strong>{markdownPages.length}</strong> page-based Markdown files (
+              {formatFileSize(totalMarkdownSize)})
+            </p>
+            <div className="action-group">
+              <button type="button" onClick={handleMarkdownPagesDownload} disabled={isZipping}>
+                {isZipping ? 'Building ZIP...' : 'Download Markdown ZIP'}
+              </button>
+            </div>
+          </section>
+
+          <section className="gallery" aria-label="Generated Markdown pages">
+            {markdownPages.map((page) => (
+              <article className="page-card page-card-text" key={page.fileName}>
+                <div className="page-meta page-meta-text">
+                  <p>Page {page.pageNumber}</p>
+                  <p>{page.fileName}</p>
+                  <p className="page-snippet">{truncatePreview(page.content)}</p>
+                  <button
+                    type="button"
+                    onClick={() => downloadBlob(makeMarkdownBlob(buildMarkdownPageDocument(page)), page.fileName)}
+                  >
+                    Download Markdown
+                  </button>
+                </div>
+              </article>
+            ))}
+          </section>
+        </>
       )}
     </main>
   )

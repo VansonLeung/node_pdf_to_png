@@ -1,6 +1,7 @@
 import mupdf from 'mupdf'
 
 const RENDER_SCALE = 2
+const SUPPORTED_OUTPUT_FORMATS = new Set(['png-zip', 'markdown-single', 'markdown-pages'])
 let colorManagementReady = false
 
 function ensureColorManagement() {
@@ -24,9 +25,13 @@ self.addEventListener('message', (event) => {
     return
   }
 
-  const { requestId, buffer } = message
+  const { requestId, buffer, outputFormat = 'png-zip' } = message
 
   try {
+    if (!SUPPORTED_OUTPUT_FORMATS.has(outputFormat)) {
+      throw new Error('Unsupported output format.')
+    }
+
     ensureColorManagement()
 
     const document = mupdf.Document.openDocument(new Uint8Array(buffer), 'application/pdf')
@@ -37,6 +42,7 @@ self.addEventListener('message', (event) => {
       self.postMessage({
         type: 'start',
         requestId,
+        outputFormat,
         totalPages,
       })
 
@@ -44,30 +50,50 @@ self.addEventListener('message', (event) => {
         const page = document.loadPage(pageIndex)
 
         try {
-          const pixmap = page.toPixmap(
-            mupdf.Matrix.scale(RENDER_SCALE, RENDER_SCALE),
-            mupdf.ColorSpace.DeviceRGB,
-            false,
-          )
+          if (outputFormat === 'png-zip') {
+            const pixmap = page.toPixmap(
+              mupdf.Matrix.scale(RENDER_SCALE, RENDER_SCALE),
+              mupdf.ColorSpace.DeviceRGB,
+              false,
+            )
+
+            try {
+              const pngBytes = pixmap.asPNG()
+              const pngCopy = new Uint8Array(pngBytes)
+
+              self.postMessage(
+                {
+                  type: 'page',
+                  requestId,
+                  outputFormat,
+                  pageNumber: pageIndex + 1,
+                  totalPages,
+                  width: pixmap.getWidth(),
+                  height: pixmap.getHeight(),
+                  pngBuffer: pngCopy.buffer,
+                },
+                [pngCopy.buffer],
+              )
+            } finally {
+              pixmap.destroy()
+            }
+
+            continue
+          }
+
+          const structuredText = page.toStructuredText()
 
           try {
-            const pngBytes = pixmap.asPNG()
-            const pngCopy = new Uint8Array(pngBytes)
-
-            self.postMessage(
-              {
-                type: 'page',
-                requestId,
-                pageNumber: pageIndex + 1,
-                totalPages,
-                width: pixmap.getWidth(),
-                height: pixmap.getHeight(),
-                pngBuffer: pngCopy.buffer,
-              },
-              [pngCopy.buffer],
-            )
+            self.postMessage({
+              type: 'page',
+              requestId,
+              outputFormat,
+              pageNumber: pageIndex + 1,
+              totalPages,
+              markdown: structuredText.asText(),
+            })
           } finally {
-            pixmap.destroy()
+            structuredText.destroy()
           }
         } finally {
           page.destroy()
@@ -80,6 +106,7 @@ self.addEventListener('message', (event) => {
     self.postMessage({
       type: 'done',
       requestId,
+      outputFormat,
     })
   } catch (error) {
     self.postMessage({
