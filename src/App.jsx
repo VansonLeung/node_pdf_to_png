@@ -1,13 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import JSZip from 'jszip'
+import { PDFDocument } from 'pdf-lib'
 import './App.css'
 
-const MARKDOWN_MIME_TYPE = 'text/markdown;charset=utf-8'
-const OUTPUT_OPTIONS = [
-  { value: 'png-zip', label: 'PNG pages as ZIP' },
-  { value: 'markdown-single', label: 'Single Markdown file' },
-  { value: 'markdown-pages', label: 'One Markdown file per page' },
-]
+const AUTO_SCROLL_EDGE_THRESHOLD = 96
+const AUTO_SCROLL_MAX_STEP = 24
 
 function formatFileSize(bytes) {
   if (bytes < 1024) {
@@ -24,61 +20,15 @@ function formatFileSize(bytes) {
 function sanitizeBaseName(fileName) {
   return (
     fileName
-      .replace(/\.pdf$/i, '')
+      .replace(/\.(pdf|png)$/i, '')
       .replace(/[^a-zA-Z0-9._-]/g, '-')
       .replace(/-+/g, '-')
-      .replace(/^-|-$/g, '') || 'document'
+      .replace(/^-|-$/g, '') || 'export'
   )
 }
 
 function makePngFileName(baseName, pageNumber) {
   return `${baseName}-page-${String(pageNumber).padStart(3, '0')}.png`
-}
-
-function makeMarkdownFileName(baseName, pageNumber) {
-  return `${baseName}-page-${String(pageNumber).padStart(3, '0')}.md`
-}
-
-function getDocumentTitle(fileName) {
-  return fileName.replace(/\.pdf$/i, '').trim() || 'Document'
-}
-
-function normalizeMarkdownText(text) {
-  const normalized = text
-    .replace(/\r\n/g, '\n')
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
-
-  return normalized || '_No extractable text on this page._'
-}
-
-function buildMarkdownPageDocument(page) {
-  return `# Page ${page.pageNumber}\n\n${page.content}\n`
-}
-
-function buildCombinedMarkdownDocument(fileName, pages) {
-  if (!pages.length) {
-    return ''
-  }
-
-  const sections = pages
-    .map((page) => `## Page ${page.pageNumber}\n\n${page.content}`)
-    .join('\n\n---\n\n')
-
-  return `# ${getDocumentTitle(fileName)}\n\n${sections}\n`
-}
-
-function makeMarkdownBlob(content) {
-  return new Blob([content], { type: MARKDOWN_MIME_TYPE })
-}
-
-function truncatePreview(text, maxLength = 320) {
-  if (text.length <= maxLength) {
-    return text
-  }
-
-  return `${text.slice(0, maxLength).trimEnd()}...`
 }
 
 function downloadBlob(blob, filename) {
@@ -90,70 +40,111 @@ function downloadBlob(blob, filename) {
   URL.revokeObjectURL(url)
 }
 
+function createItemId(prefix) {
+  if (globalThis.crypto?.randomUUID) {
+    return `${prefix}-${globalThis.crypto.randomUUID()}`
+  }
+
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function revokeItemPreview(item) {
+  URL.revokeObjectURL(item.previewUrl)
+}
+
+function insertItemBefore(items, sourceId, targetId) {
+  const sourceIndex = items.findIndex((item) => item.id === sourceId)
+  const targetIndex = items.findIndex((item) => item.id === targetId)
+
+  if (sourceIndex === -1 || targetIndex === -1 || sourceIndex === targetIndex) {
+    return items
+  }
+
+  const nextItems = [...items]
+  const [movedItem] = nextItems.splice(sourceIndex, 1)
+  const adjustedTargetIndex = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex
+  nextItems.splice(adjustedTargetIndex, 0, movedItem)
+  return nextItems
+}
+
+function moveItemToEnd(items, sourceId) {
+  const sourceIndex = items.findIndex((item) => item.id === sourceId)
+
+  if (sourceIndex === -1 || sourceIndex === items.length - 1) {
+    return items
+  }
+
+  const nextItems = [...items]
+  const [movedItem] = nextItems.splice(sourceIndex, 1)
+  nextItems.push(movedItem)
+  return nextItems
+}
+
+function loadPngItem(file) {
+  return new Promise((resolve, reject) => {
+    const previewUrl = URL.createObjectURL(file)
+    const image = new Image()
+
+    image.onload = () => {
+      resolve({
+        id: createItemId('png'),
+        kind: 'png',
+        sourceName: file.name,
+        fileName: file.name.toLowerCase().endsWith('.png') ? file.name : `${sanitizeBaseName(file.name)}.png`,
+        width: image.naturalWidth,
+        height: image.naturalHeight,
+        blob: file,
+        previewUrl,
+      })
+    }
+
+    image.onerror = () => {
+      URL.revokeObjectURL(previewUrl)
+      reject(new Error(`Could not read ${file.name} as a PNG image.`))
+    }
+
+    image.src = previewUrl
+  })
+}
+
+function makeExportFileName(items) {
+  if (items.length === 1) {
+    return `${sanitizeBaseName(items[0].sourceName)}.pdf`
+  }
+
+  return 'reordered-items.pdf'
+}
+
 function App() {
-  const [outputFormat, setOutputFormat] = useState('png-zip')
-  const [resultFormat, setResultFormat] = useState('')
-  const [sourcePdfName, setSourcePdfName] = useState('')
-  const [pngPages, setPngPages] = useState([])
-  const [markdownPages, setMarkdownPages] = useState([])
-  const [progress, setProgress] = useState({ current: 0, total: 0 })
-  const [isRendering, setIsRendering] = useState(false)
-  const [isZipping, setIsZipping] = useState(false)
+  const [items, setItems] = useState([])
+  const [progress, setProgress] = useState({ current: 0, total: 0, label: '' })
+  const [isProcessingPdf, setIsProcessingPdf] = useState(false)
+  const [isExportingPdf, setIsExportingPdf] = useState(false)
   const [errorMessage, setErrorMessage] = useState('')
+  const [draggedItemId, setDraggedItemId] = useState('')
+  const [dropTargetId, setDropTargetId] = useState('')
   const workerRef = useRef(null)
   const requestIdRef = useRef(0)
-  const pagesRef = useRef([])
-
-  function revokePages(pages) {
-    pages.forEach((page) => URL.revokeObjectURL(page.previewUrl))
-  }
-
-  function resetPages() {
-    setPngPages((existingPages) => {
-      revokePages(existingPages)
-      return []
-    })
-  }
-
-  function resetResults() {
-    resetPages()
-    setMarkdownPages([])
-  }
+  const itemsRef = useRef([])
+  const dragPointerYRef = useRef(null)
+  const autoScrollFrameRef = useRef(0)
 
   const totalPngSize = useMemo(
-    () => pngPages.reduce((sum, page) => sum + page.blob.size, 0),
-    [pngPages],
+    () => items.reduce((sum, item) => sum + item.blob.size, 0),
+    [items],
   )
 
-  const combinedMarkdown = useMemo(
-    () => buildCombinedMarkdownDocument(sourcePdfName, markdownPages),
-    [markdownPages, sourcePdfName],
+  const pdfPageCount = useMemo(
+    () => items.filter((item) => item.kind === 'pdf-page').length,
+    [items],
   )
 
-  const totalMarkdownSize = useMemo(() => {
-    if (!markdownPages.length) {
-      return 0
-    }
-
-    if (resultFormat === 'markdown-single') {
-      return makeMarkdownBlob(combinedMarkdown).size
-    }
-
-    return markdownPages.reduce(
-      (sum, page) => sum + makeMarkdownBlob(buildMarkdownPageDocument(page)).size,
-      0,
-    )
-  }, [combinedMarkdown, markdownPages, resultFormat])
-
-  const progressLabel =
-    resultFormat === 'png-zip' ? 'Rendering pages in background' : 'Extracting markdown in background'
-  const hasPngResults = resultFormat === 'png-zip' && pngPages.length > 0
-  const hasMarkdownSingleResult = resultFormat === 'markdown-single' && markdownPages.length > 0
-  const hasMarkdownPageResults = resultFormat === 'markdown-pages' && markdownPages.length > 0
+  const pngImageCount = items.length - pdfPageCount
+  const isBusy = isProcessingPdf || isExportingPdf
 
   useEffect(() => {
-    pagesRef.current = pngPages
-  }, [pngPages])
+    itemsRef.current = items
+  }, [items])
 
   useEffect(() => {
     workerRef.current = new Worker(new URL('./pdfRenderWorker.js', import.meta.url), {
@@ -163,235 +154,377 @@ function App() {
     return () => {
       workerRef.current?.terminate()
       workerRef.current = null
-      revokePages(pagesRef.current)
+      itemsRef.current.forEach(revokeItemPreview)
     }
   }, [])
 
-  async function handlePdfChange(event) {
-    const file = event.target.files?.[0]
+  useEffect(() => {
+    if (!draggedItemId) {
+      dragPointerYRef.current = null
 
-    if (!file) {
-      return
-    }
-
-    const looksLikePdf =
-      file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
-
-    if (!looksLikePdf) {
-      setErrorMessage('Please choose a valid PDF file.')
-      return
-    }
-
-    const selectedOutputFormat = outputFormat
-
-    setErrorMessage('')
-    setSourcePdfName(file.name)
-    setResultFormat(selectedOutputFormat)
-    setIsRendering(true)
-    setProgress({ current: 0, total: 0 })
-
-    try {
-      resetResults()
-      const data = await file.arrayBuffer()
-      const worker = workerRef.current
-
-      if (!worker) {
-        throw new Error('Render worker is not available.')
+      if (autoScrollFrameRef.current) {
+        cancelAnimationFrame(autoScrollFrameRef.current)
+        autoScrollFrameRef.current = 0
       }
 
-      const baseName = sanitizeBaseName(file.name)
-      const requestId = (requestIdRef.current += 1)
+      return undefined
+    }
 
-      await new Promise((resolve, reject) => {
-        const onMessage = (eventData) => {
-          const message = eventData.data
+    function scheduleAutoScroll() {
+      if (autoScrollFrameRef.current) {
+        return
+      }
 
-          if (!message || message.requestId !== requestId) {
-            return
-          }
+      autoScrollFrameRef.current = requestAnimationFrame(() => {
+        autoScrollFrameRef.current = 0
 
-          if (message.type === 'start') {
-            setProgress({ current: 0, total: message.totalPages })
-            return
-          }
-
-          if (message.type === 'page') {
-            if (selectedOutputFormat === 'png-zip') {
-              const blob = new Blob([message.pngBuffer], { type: 'image/png' })
-              const nextPage = {
-                pageNumber: message.pageNumber,
-                fileName: makePngFileName(baseName, message.pageNumber),
-                blob,
-                width: message.width,
-                height: message.height,
-                previewUrl: URL.createObjectURL(blob),
-              }
-
-              setPngPages((existingPages) => [...existingPages, nextPage])
-            } else {
-              const nextPage = {
-                pageNumber: message.pageNumber,
-                fileName: makeMarkdownFileName(baseName, message.pageNumber),
-                content: normalizeMarkdownText(message.markdown || ''),
-              }
-
-              setMarkdownPages((existingPages) => [...existingPages, nextPage])
-            }
-
-            setProgress({ current: message.pageNumber, total: message.totalPages })
-            return
-          }
-
-          if (message.type === 'done') {
-            cleanup()
-            resolve()
-            return
-          }
-
-          if (message.type === 'error') {
-            cleanup()
-            reject(new Error(message.error || 'Could not process the PDF.'))
-          }
+        if (dragPointerYRef.current == null) {
+          return
         }
 
-        const onError = () => {
-          cleanup()
-          reject(new Error('The render worker crashed while processing the PDF.'))
+        const viewportHeight = window.innerHeight
+        const distanceToTop = dragPointerYRef.current
+        const distanceToBottom = viewportHeight - dragPointerYRef.current
+        let scrollDelta = 0
+
+        if (distanceToTop < AUTO_SCROLL_EDGE_THRESHOLD) {
+          const intensity = (AUTO_SCROLL_EDGE_THRESHOLD - distanceToTop) / AUTO_SCROLL_EDGE_THRESHOLD
+          scrollDelta = -Math.ceil(intensity * AUTO_SCROLL_MAX_STEP)
+        } else if (distanceToBottom < AUTO_SCROLL_EDGE_THRESHOLD) {
+          const intensity = (AUTO_SCROLL_EDGE_THRESHOLD - distanceToBottom) / AUTO_SCROLL_EDGE_THRESHOLD
+          scrollDelta = Math.ceil(intensity * AUTO_SCROLL_MAX_STEP)
         }
 
-        function cleanup() {
-          worker.removeEventListener('message', onMessage)
-          worker.removeEventListener('error', onError)
+        if (scrollDelta !== 0) {
+          window.scrollBy({ top: scrollDelta, left: 0, behavior: 'auto' })
+          scheduleAutoScroll()
         }
-
-        worker.addEventListener('message', onMessage)
-        worker.addEventListener('error', onError)
-        worker.postMessage(
-          {
-            type: 'convert-pdf',
-            requestId,
-            buffer: data,
-            outputFormat: selectedOutputFormat,
-          },
-          [data],
-        )
       })
+    }
+
+    function handleWindowDragOver(event) {
+      dragPointerYRef.current = event.clientY
+      scheduleAutoScroll()
+    }
+
+    function stopAutoScroll() {
+      dragPointerYRef.current = null
+
+      if (autoScrollFrameRef.current) {
+        cancelAnimationFrame(autoScrollFrameRef.current)
+        autoScrollFrameRef.current = 0
+      }
+    }
+
+    window.addEventListener('dragover', handleWindowDragOver)
+    window.addEventListener('drop', stopAutoScroll)
+    window.addEventListener('dragend', stopAutoScroll)
+
+    return () => {
+      window.removeEventListener('dragover', handleWindowDragOver)
+      window.removeEventListener('drop', stopAutoScroll)
+      window.removeEventListener('dragend', stopAutoScroll)
+      stopAutoScroll()
+    }
+  }, [draggedItemId])
+
+  function clearDragState() {
+    dragPointerYRef.current = null
+
+    if (autoScrollFrameRef.current) {
+      cancelAnimationFrame(autoScrollFrameRef.current)
+      autoScrollFrameRef.current = 0
+    }
+
+    setDraggedItemId('')
+    setDropTargetId('')
+  }
+
+  function clearAllItems() {
+    setItems((existingItems) => {
+      existingItems.forEach(revokeItemPreview)
+      return []
+    })
+    clearDragState()
+    setErrorMessage('')
+  }
+
+  function removeItem(itemId) {
+    setItems((existingItems) => {
+      const itemToRemove = existingItems.find((item) => item.id === itemId)
+
+      if (!itemToRemove) {
+        return existingItems
+      }
+
+      revokeItemPreview(itemToRemove)
+      return existingItems.filter((item) => item.id !== itemId)
+    })
+  }
+
+  async function appendPdfFile(file) {
+    const data = await file.arrayBuffer()
+    const worker = workerRef.current
+
+    if (!worker) {
+      throw new Error('Render worker is not available.')
+    }
+
+    const baseName = sanitizeBaseName(file.name)
+    const requestId = (requestIdRef.current += 1)
+
+    await new Promise((resolve, reject) => {
+      const onMessage = (eventData) => {
+        const message = eventData.data
+
+        if (!message || message.requestId !== requestId) {
+          return
+        }
+
+        if (message.type === 'start') {
+          setProgress({ current: 0, total: message.totalPages, label: file.name })
+          return
+        }
+
+        if (message.type === 'page') {
+          const blob = new Blob([message.pngBuffer], { type: 'image/png' })
+
+          setItems((existingItems) => [
+            ...existingItems,
+            {
+              id: createItemId('pdf-page'),
+              kind: 'pdf-page',
+              sourceName: file.name,
+              pageNumber: message.pageNumber,
+              fileName: makePngFileName(baseName, message.pageNumber),
+              blob,
+              width: message.width,
+              height: message.height,
+              previewUrl: URL.createObjectURL(blob),
+            },
+          ])
+
+          setProgress({ current: message.pageNumber, total: message.totalPages, label: file.name })
+          return
+        }
+
+        if (message.type === 'done') {
+          cleanup()
+          resolve()
+          return
+        }
+
+        if (message.type === 'error') {
+          cleanup()
+          reject(new Error(message.error || `Could not process ${file.name}.`))
+        }
+      }
+
+      const onError = () => {
+        cleanup()
+        reject(new Error(`The render worker crashed while processing ${file.name}.`))
+      }
+
+      function cleanup() {
+        worker.removeEventListener('message', onMessage)
+        worker.removeEventListener('error', onError)
+      }
+
+      worker.addEventListener('message', onMessage)
+      worker.addEventListener('error', onError)
+      worker.postMessage(
+        {
+          type: 'convert-pdf',
+          requestId,
+          buffer: data,
+          outputFormat: 'png-zip',
+        },
+        [data],
+      )
+    })
+  }
+
+  async function handlePdfChange(event) {
+    const files = Array.from(event.target.files || [])
+
+    if (!files.length) {
+      return
+    }
+
+    setErrorMessage('')
+    setIsProcessingPdf(true)
+
+    try {
+      for (const file of files) {
+        const looksLikePdf =
+          file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
+
+        if (!looksLikePdf) {
+          throw new Error(`Please choose PDF files only. ${file.name} is not a PDF.`)
+        }
+
+        await appendPdfFile(file)
+      }
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : 'Could not process the PDF.')
-      resetResults()
-      setResultFormat('')
+      setErrorMessage(error instanceof Error ? error.message : 'Could not process the PDF files.')
     } finally {
-      setIsRendering(false)
+      setIsProcessingPdf(false)
+      setProgress({ current: 0, total: 0, label: '' })
       event.target.value = ''
     }
   }
 
-  async function handlePngZipDownload() {
-    if (!pngPages.length) {
+  async function handlePngChange(event) {
+    const files = Array.from(event.target.files || [])
+
+    if (!files.length) {
       return
     }
 
-    setIsZipping(true)
     setErrorMessage('')
 
     try {
-      const zip = new JSZip()
+      const newItems = []
 
-      pngPages.forEach((page) => {
-        zip.file(page.fileName, page.blob)
-      })
+      for (const file of files) {
+        const looksLikePng = file.type === 'image/png' || file.name.toLowerCase().endsWith('.png')
 
-      const zipBlob = await zip.generateAsync({ type: 'blob' })
-      const zipBaseName = sanitizeBaseName(sourcePdfName || 'document')
-      downloadBlob(zipBlob, `${zipBaseName}-png-pages.zip`)
+        if (!looksLikePng) {
+          throw new Error(`Please choose PNG files only. ${file.name} is not a PNG.`)
+        }
+
+        newItems.push(await loadPngItem(file))
+      }
+
+      setItems((existingItems) => [...existingItems, ...newItems])
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : 'Could not create ZIP file.')
+      setErrorMessage(error instanceof Error ? error.message : 'Could not append the PNG files.')
     } finally {
-      setIsZipping(false)
+      event.target.value = ''
     }
   }
 
-  function handleMarkdownSingleDownload() {
-    if (!combinedMarkdown) {
-      return
-    }
-
-    const baseName = sanitizeBaseName(sourcePdfName || 'document')
-    downloadBlob(makeMarkdownBlob(combinedMarkdown), `${baseName}.md`)
+  function handleDragStart(event, itemId) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', itemId)
+    setDraggedItemId(itemId)
+    setDropTargetId(itemId)
   }
 
-  async function handleMarkdownPagesDownload() {
-    if (!markdownPages.length) {
+  function handleDragOver(event, itemId) {
+    event.preventDefault()
+
+    if (draggedItemId && draggedItemId !== itemId) {
+      setDropTargetId(itemId)
+    }
+  }
+
+  function handleDropBefore(event, itemId) {
+    event.preventDefault()
+    const sourceId = event.dataTransfer.getData('text/plain') || draggedItemId
+
+    clearDragState()
+
+    if (!sourceId || sourceId === itemId) {
       return
     }
 
-    setIsZipping(true)
+    setItems((existingItems) => insertItemBefore(existingItems, sourceId, itemId))
+  }
+
+  function handleDropAtEnd(event) {
+    event.preventDefault()
+    const sourceId = event.dataTransfer.getData('text/plain') || draggedItemId
+
+    clearDragState()
+
+    if (!sourceId) {
+      return
+    }
+
+    setItems((existingItems) => moveItemToEnd(existingItems, sourceId))
+  }
+
+  async function handlePdfDownload() {
+    if (!items.length) {
+      return
+    }
+
+    setIsExportingPdf(true)
     setErrorMessage('')
 
     try {
-      const zip = new JSZip()
+      const pdfDocument = await PDFDocument.create()
 
-      markdownPages.forEach((page) => {
-        zip.file(page.fileName, buildMarkdownPageDocument(page))
-      })
+      for (const item of items) {
+        const pngBytes = await item.blob.arrayBuffer()
+        const pngImage = await pdfDocument.embedPng(pngBytes)
+        const page = pdfDocument.addPage([item.width, item.height])
 
-      const zipBlob = await zip.generateAsync({ type: 'blob' })
-      const zipBaseName = sanitizeBaseName(sourcePdfName || 'document')
-      downloadBlob(zipBlob, `${zipBaseName}-markdown-pages.zip`)
+        page.drawImage(pngImage, {
+          x: 0,
+          y: 0,
+          width: item.width,
+          height: item.height,
+        })
+      }
+
+      const pdfBytes = await pdfDocument.save()
+      downloadBlob(new Blob([pdfBytes], { type: 'application/pdf' }), makeExportFileName(items))
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : 'Could not create ZIP file.')
+      setErrorMessage(error instanceof Error ? error.message : 'Could not build the PDF file.')
     } finally {
-      setIsZipping(false)
+      setIsExportingPdf(false)
     }
   }
 
   return (
     <main className="app-shell">
       <section className="panel panel-hero">
-        <p className="eyebrow">PDF Export Studio</p>
-        <h1>Turn PDFs into PNGs or Markdown files in the browser.</h1>
+        <p className="eyebrow">PDF Assembly Studio</p>
+        <h1>Append PDF pages and PNGs, reorder them, then export one PDF.</h1>
         <p className="subtitle">
-          Choose PNG rendering, a single Markdown export, or one Markdown file per page. Everything
-          runs client-side in a worker, so the PDF never leaves the browser.
+          Each imported PDF page is rendered client-side into a PNG-backed card. Append more PDFs,
+          add standalone PNG images, drag cards into the order you want, and download the result as
+          a single PDF.
         </p>
       </section>
 
       <section className="panel panel-uploader">
         <div className="controls-grid">
-          <label className="field-label" htmlFor="output-format">
-            <span>Output format</span>
-            <select
-              id="output-format"
-              value={outputFormat}
-              onChange={(event) => setOutputFormat(event.target.value)}
-              disabled={isRendering}
-            >
-              {OUTPUT_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-
           <label className="file-label" htmlFor="pdf-input">
-            <span>Choose PDF</span>
+            <span>Append PDF files</span>
             <input
               id="pdf-input"
               type="file"
               accept="application/pdf,.pdf"
+              multiple
               onChange={handlePdfChange}
-              disabled={isRendering}
+              disabled={isBusy}
+            />
+          </label>
+
+          <label className="file-label" htmlFor="png-input">
+            <span>Append PNG images</span>
+            <input
+              id="png-input"
+              type="file"
+              accept="image/png,.png"
+              multiple
+              onChange={handlePngChange}
+              disabled={isBusy}
             />
           </label>
         </div>
 
-        {sourcePdfName && <p className="meta-line">Source: {sourcePdfName}</p>}
+        <p className="meta-line">
+          Appended items stay in memory until you remove them or clear the board.
+        </p>
 
-        {isRendering && progress.total > 0 && (
+        {isProcessingPdf && progress.total > 0 && (
           <div className="progress-wrap" role="status" aria-live="polite">
             <p>
-              {progressLabel}: {progress.current}/{progress.total}
+              Rendering {progress.label}: {progress.current}/{progress.total}
             </p>
             <div className="progress-track" aria-hidden="true">
               <div
@@ -405,90 +538,91 @@ function App() {
         {errorMessage && <p className="error-box">{errorMessage}</p>}
       </section>
 
-      {hasPngResults && (
+      {items.length > 0 && (
         <section className="panel panel-actions">
           <p>
-            Generated <strong>{pngPages.length}</strong> PNG files ({formatFileSize(totalPngSize)})
+            Board contains <strong>{items.length}</strong> items: <strong>{pdfPageCount}</strong>{' '}
+            PDF pages and <strong>{pngImageCount}</strong> PNG images ({formatFileSize(totalPngSize)})
           </p>
           <div className="action-group">
-            <button type="button" onClick={handlePngZipDownload} disabled={isZipping}>
-              {isZipping ? 'Building ZIP...' : 'Download ZIP'}
+            <button type="button" onClick={handlePdfDownload} disabled={isBusy}>
+              {isExportingPdf ? 'Building PDF...' : 'Download reordered PDF'}
+            </button>
+            <button type="button" className="button-secondary" onClick={clearAllItems} disabled={isBusy}>
+              Clear board
             </button>
           </div>
         </section>
       )}
 
-      {hasPngResults && (
-        <section className="gallery" aria-label="Generated PNG pages">
-          {pngPages.map((page) => (
-            <article className="page-card" key={page.fileName}>
-              <img src={page.previewUrl} alt={`PDF page ${page.pageNumber}`} loading="lazy" />
-              <div className="page-meta">
-                <p>Page {page.pageNumber}</p>
-                <p>
-                  {page.width} x {page.height}
-                </p>
-                <button type="button" onClick={() => downloadBlob(page.blob, page.fileName)}>
-                  Download PNG
-                </button>
-              </div>
-            </article>
-          ))}
+      {items.length > 0 && (
+        <section className="panel panel-notes">
+          <p className="section-title">Arrange the board</p>
+          <p className="meta-line">
+            Drag any card onto another card to place it before that item. Drop onto the end zone to
+            move it to the last position.
+          </p>
         </section>
       )}
 
-      {hasMarkdownSingleResult && (
+      {items.length > 0 && (
         <>
-          <section className="panel panel-actions">
-            <p>
-              Generated one Markdown file from <strong>{markdownPages.length}</strong> pages (
-              {formatFileSize(totalMarkdownSize)})
-            </p>
-            <div className="action-group">
-              <button type="button" onClick={handleMarkdownSingleDownload}>
-                Download Markdown
-              </button>
-            </div>
-          </section>
-
-          <section className="panel">
-            <p className="section-title">Markdown preview</p>
-            <pre className="markdown-preview">{combinedMarkdown}</pre>
-          </section>
-        </>
-      )}
-
-      {hasMarkdownPageResults && (
-        <>
-          <section className="panel panel-actions">
-            <p>
-              Generated <strong>{markdownPages.length}</strong> page-based Markdown files (
-              {formatFileSize(totalMarkdownSize)})
-            </p>
-            <div className="action-group">
-              <button type="button" onClick={handleMarkdownPagesDownload} disabled={isZipping}>
-                {isZipping ? 'Building ZIP...' : 'Download Markdown ZIP'}
-              </button>
-            </div>
-          </section>
-
-          <section className="gallery" aria-label="Generated Markdown pages">
-            {markdownPages.map((page) => (
-              <article className="page-card page-card-text" key={page.fileName}>
-                <div className="page-meta page-meta-text">
-                  <p>Page {page.pageNumber}</p>
-                  <p>{page.fileName}</p>
-                  <p className="page-snippet">{truncatePreview(page.content)}</p>
+          <section className="gallery" aria-label="Ordered PDF and PNG items">
+            {items.map((item, index) => (
+              <article
+                className={`page-card ${dropTargetId === item.id ? 'page-card-drop-target' : ''}`}
+                key={item.id}
+                draggable={!isBusy}
+                onDragStart={(event) => handleDragStart(event, item.id)}
+                onDragOver={(event) => handleDragOver(event, item.id)}
+                onDrop={(event) => handleDropBefore(event, item.id)}
+                onDragEnd={clearDragState}
+              >
+                <div className="preview-frame">
+                  <span className="item-order">{String(index + 1).padStart(2, '0')}</span>
+                  <img
+                    src={item.previewUrl}
+                    alt={item.kind === 'pdf-page' ? `PDF page ${item.pageNumber}` : item.sourceName}
+                    loading="lazy"
+                  />
+                </div>
+                <p>
+                  {item.kind === 'pdf-page' ? `PDF page ${item.pageNumber}` : 'PNG image'}
+                </p>
+                <p className="page-source">{item.sourceName}</p>
+                <p>
+                  {item.width} x {item.height}
+                </p>
+                <div className="card-actions">
+                  <button type="button" onClick={() => downloadBlob(item.blob, item.fileName)}>
+                    Download PNG
+                  </button>
                   <button
                     type="button"
-                    onClick={() => downloadBlob(makeMarkdownBlob(buildMarkdownPageDocument(page)), page.fileName)}
+                    className="button-secondary"
+                    onClick={() => removeItem(item.id)}
+                    disabled={isBusy}
                   >
-                    Download Markdown
+                    Remove
                   </button>
                 </div>
               </article>
             ))}
           </section>
+
+          <div
+            className={`drop-zone ${dropTargetId === 'end' ? 'drop-zone-active' : ''}`}
+            onDragOver={(event) => {
+              event.preventDefault()
+              if (draggedItemId) {
+                setDropTargetId('end')
+              }
+            }}
+            onDrop={handleDropAtEnd}
+            onDragEnd={clearDragState}
+          >
+            Drop here to move an item to the end
+          </div>
         </>
       )}
     </main>
